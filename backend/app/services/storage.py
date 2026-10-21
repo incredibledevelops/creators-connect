@@ -1,0 +1,62 @@
+"""Local storage for system files: avatars, chat uploads.
+User media that gets scheduled to socials is stored in the user's Google Drive."""
+from pathlib import Path
+import uuid
+
+from fastapi import UploadFile, HTTPException
+
+from app.config import settings
+
+STORAGE_ROOT = Path(settings.STORAGE_DIR).resolve()
+AVATAR_DIR = STORAGE_ROOT / "avatars"
+CHAT_DIR = STORAGE_ROOT / "chat"
+PROJECT_DIR = STORAGE_ROOT / "projects"
+
+for _d in (AVATAR_DIR, CHAT_DIR, PROJECT_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+ALLOWED_CHAT_TYPES = ALLOWED_IMAGE_TYPES | {
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "text/plain",
+    "video/mp4",
+    "video/quicktime",
+    "audio/mpeg",
+    "audio/wav",
+    "audio/webm",
+}
+
+MAX_AVATAR_SIZE = 2 * 1024 * 1024          # 2 MB
+MAX_CHAT_FILE_SIZE = 50 * 1024 * 1024      # 50 MB
+
+
+async def save_avatar(user_id: str, file: UploadFile) -> str:
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Avatar must be JPEG, PNG, WEBP or GIF.")
+    content = await file.read()
+    if len(content) > MAX_AVATAR_SIZE:
+        raise HTTPException(status_code=400, detail="Avatar must be ≤ 2 MB.")
+    ext = Path(file.filename or "").suffix.lower() or ".jpg"
+    fname = f"{user_id}_{uuid.uuid4().hex}{ext}"
+    (AVATAR_DIR / fname).write_bytes(content)
+    return f"/static/avatars/{fname}"
+
+
+async def save_chat_file(conversation_id: str, file: UploadFile) -> dict:
+    if file.content_type not in ALLOWED_CHAT_TYPES:
+        raise HTTPException(status_code=400, detail="File type not allowed.")
+    content = await file.read()
+    if len(content) > MAX_CHAT_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File must be ≤ 50 MB.")
+    ext = Path(file.filename or "").suffix.lower()
+    stored = f"{conversation_id}_{uuid.uuid4().hex}{ext}"
+    (CHAT_DIR / stored).write_bytes(content)
+    return {
+        "name": file.filename or stored,
+        "stored_name": stored,
+        "url": f"/static/chat/{stored}",
+        "type": file.content_type,
+        "size": len(content),
+    }
