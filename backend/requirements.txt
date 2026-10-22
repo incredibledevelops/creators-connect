@@ -16,3 +16,13 @@ google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 APScheduler==3.10.4
 python-dotenv==1.0.1
+slowapi==0.1.9
+cryptography==43.0.3
+aiosmtplib==3.0.2
+requests==2.32.3
+bleach==6.2.0
+requests==2.32.3
+google-api-python-client==2.154.0
+google-auth==2.36.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0

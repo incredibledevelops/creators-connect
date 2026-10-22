@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
-from typing import Optional
 
 from bson import ObjectId
 from fastapi import (
-    APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect,
+    APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket,
+    WebSocketDisconnect,
 )
 
 from app.core.security import decode_token
@@ -11,12 +11,12 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.schemas.chat import ConversationCreate, MessageCreate
 from app.services.storage import save_chat_file
+from app.utils import activity as activity_service
 from app.utils.serializers import doc_to_dict, serialize_user
 
 router = APIRouter()
 
 
-# ---------- WebSocket manager ----------
 class ConnectionManager:
     def __init__(self) -> None:
         self.rooms: dict[str, set[WebSocket]] = {}
@@ -42,7 +42,6 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-# ---------- Helpers ----------
 def _oid(value: str, label: str = "id") -> ObjectId:
     try:
         return ObjectId(value)
@@ -60,20 +59,53 @@ async def _ensure_participant(conversation_id: str, user_id: ObjectId) -> dict:
     return convo
 
 
-# ---------- Endpoints ----------
+# ---------- Conversations ----------
 @router.get("/conversations")
 async def list_conversations(user: dict = Depends(get_current_user)):
     db = get_db()
     cursor = db.conversations.find({"participant_ids": user["_id"]}).sort("last_message_at", -1)
     convos = await cursor.to_list(length=100)
 
-    # Enrich with display info
+    out = []
     for c in convos:
-        c["id"] = str(c.pop("_id"))
-        c.pop("participant_ids", None)
-        c.pop("created_by", None)
+        cid = c["_id"]
 
-    return {"conversations": [doc_to_dict(c) for c in convos]}
+        # Unread count for current user
+        last_read = await db.chat_reads.find_one(
+            {"conversation_id": cid, "user_id": user["_id"]}
+        )
+        last_read_at = last_read["last_read_at"] if last_read else datetime.fromtimestamp(0, tz=timezone.utc)
+        unread = await db.messages.count_documents(
+            {"conversation_id": cid, "created_at": {"$gt": last_read_at},
+             "sender_id": {"$ne": user["_id"]}}
+        )
+
+        last_msg = await db.messages.find_one(
+            {"conversation_id": cid}, sort=[("_id", -1)]
+        )
+
+        # Enrich participant summary for DMs
+        participants_info = []
+        other_ids = [pid for pid in c.get("participant_ids", []) if pid != user["_id"]]
+        if other_ids:
+            others = await db.users.find({"_id": {"$in": other_ids}}).to_list(20)
+            participants_info = [serialize_user(u) for u in others]
+
+        out.append({
+            "id": str(cid),
+            "type": c.get("type"),
+            "name": c.get("name"),
+            "project_id": str(c["project_id"]) if c.get("project_id") else None,
+            "last_message_at": (c.get("last_message_at") or c.get("created_at")).isoformat(),
+            "last_message": {
+                "content": last_msg.get("content", "") if last_msg else "",
+                "sender_id": str(last_msg["sender_id"]) if last_msg else None,
+                "created_at": last_msg["created_at"].isoformat() if last_msg else None,
+            } if last_msg else None,
+            "unread_count": unread,
+            "participants": participants_info,
+        })
+    return {"conversations": out}
 
 
 @router.post("/conversations", status_code=201)
@@ -89,28 +121,22 @@ async def create_conversation(payload: ConversationCreate, user: dict = Depends(
             raise HTTPException(status_code=400, detail="You can't DM yourself.")
         if not await db.users.find_one({"_id": other}):
             raise HTTPException(status_code=404, detail="User not found.")
-
         existing = await db.conversations.find_one({
             "type": "dm",
             "participant_ids": {"$all": [user["_id"], other], "$size": 2},
         })
         if existing:
-            data = doc_to_dict(existing)
-            return {"conversation": data}
-
+            return {"conversation": doc_to_dict(existing)}
         doc = {
-            "type": "dm",
-            "name": None,
+            "type": "dm", "name": None,
             "participant_ids": [user["_id"], other],
             "created_by": user["_id"],
-            "last_message_at": now,
-            "created_at": now,
+            "last_message_at": now, "created_at": now,
         }
-        result = await db.conversations.insert_one(doc)
-        doc["_id"] = result.inserted_id
+        res = await db.conversations.insert_one(doc)
+        doc["_id"] = res.inserted_id
         return {"conversation": doc_to_dict(doc)}
 
-    # project room
     if not payload.project_id:
         raise HTTPException(status_code=400, detail="project_id is required for project rooms.")
     project = await db.projects.find_one({"_id": _oid(payload.project_id, "project id")})
@@ -133,37 +159,62 @@ async def create_conversation(payload: ConversationCreate, user: dict = Depends(
         "project_id": project["_id"],
         "participant_ids": participants,
         "created_by": user["_id"],
-        "last_message_at": now,
-        "created_at": now,
+        "last_message_at": now, "created_at": now,
     }
-    result = await db.conversations.insert_one(doc)
-    doc["_id"] = result.inserted_id
+    res = await db.conversations.insert_one(doc)
+    doc["_id"] = res.inserted_id
     return {"conversation": doc_to_dict(doc)}
+
+
+@router.get("/conversations/{conversation_id}/unread-count")
+async def unread_count(conversation_id: str, user: dict = Depends(get_current_user)):
+    convo = await _ensure_participant(conversation_id, user["_id"])
+    db = get_db()
+    last_read = await db.chat_reads.find_one(
+        {"conversation_id": convo["_id"], "user_id": user["_id"]}
+    )
+    last_read_at = last_read["last_read_at"] if last_read else datetime.fromtimestamp(0, tz=timezone.utc)
+    count = await db.messages.count_documents({
+        "conversation_id": convo["_id"],
+        "created_at": {"$gt": last_read_at},
+        "sender_id": {"$ne": user["_id"]},
+    })
+    return {"unread_count": count}
+
+
+@router.post("/conversations/{conversation_id}/read")
+async def mark_read(conversation_id: str, user: dict = Depends(get_current_user)):
+    convo = await _ensure_participant(conversation_id, user["_id"])
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    await db.chat_reads.update_one(
+        {"conversation_id": convo["_id"], "user_id": user["_id"]},
+        {"$set": {"last_read_at": now}},
+        upsert=True,
+    )
+    return {"message": "Marked as read.", "read_at": now.isoformat()}
 
 
 @router.get("/conversations/{conversation_id}/messages")
 async def list_messages(
     conversation_id: str,
     limit: int = Query(default=50, ge=1, le=200),
-    before: Optional[str] = Query(default=None),
+    before: str | None = Query(default=None),
     user: dict = Depends(get_current_user),
 ):
     convo = await _ensure_participant(conversation_id, user["_id"])
     db = get_db()
-
     query: dict = {"conversation_id": convo["_id"]}
     if before:
         try:
             query["_id"] = {"$lt": ObjectId(before)}
         except Exception:
             pass
-
-    cursor = db.messages.find(query).sort("_id", -1).limit(limit)
-    msgs = await cursor.to_list(length=limit)
+    msgs = await db.messages.find(query).sort("_id", -1).limit(limit).to_list(limit)
     msgs.reverse()
 
     sender_ids = list({m["sender_id"] for m in msgs})
-    senders = await db.users.find({"_id": {"$in": sender_ids}}).to_list(length=100)
+    senders = await db.users.find({"_id": {"$in": sender_ids}}).to_list(100) if sender_ids else []
     sender_map = {str(u["_id"]): serialize_user(u) for u in senders}
 
     out = []
@@ -193,17 +244,28 @@ async def send_message(
         "attachments": [a.model_dump() for a in payload.attachments],
         "created_at": now,
     }
-    result = await db.messages.insert_one(doc)
-    doc["_id"] = result.inserted_id
-
+    res = await db.messages.insert_one(doc)
+    doc["_id"] = res.inserted_id
     await db.conversations.update_one(
         {"_id": convo["_id"]}, {"$set": {"last_message_at": now}}
+    )
+    await db.chat_reads.update_one(
+        {"conversation_id": convo["_id"], "user_id": user["_id"]},
+        {"$set": {"last_read_at": now}}, upsert=True,
     )
 
     out = doc_to_dict(doc)
     out["sender"] = serialize_user(user)
-
     await manager.broadcast(conversation_id, {"type": "message", "message": out})
+
+    for pid in convo.get("participant_ids", []):
+        if pid != user["_id"]:
+            await activity_service.emit(
+                pid, kind="new_message",
+                title=f"New message in {convo.get('name') or 'your chat'}",
+                description=payload.content[:120],
+                link=f"/chat",
+            )
     return {"message": out}
 
 
@@ -213,20 +275,17 @@ async def upload_chat_file(
     file: UploadFile = File(...),
     user: dict = Depends(get_current_user),
 ):
-    convo = await _ensure_participant(conversation_id, user["_id"])
+    await _ensure_participant(conversation_id, user["_id"])
     data = await save_chat_file(conversation_id, file)
     return {"attachment": {
-        "name": data["name"],
-        "url": data["url"],
-        "type": data["type"],
-        "size": data["size"],
+        "name": data["name"], "url": data["url"],
+        "type": data["type"], "size": data["size"],
     }}
 
 
 # ---------- WebSocket ----------
 @router.websocket("/ws/{conversation_id}")
 async def ws_endpoint(websocket: WebSocket, conversation_id: str, token: str = Query(...)):
-    # Authenticate
     try:
         payload = decode_token(token)
         if payload.get("type") != "access":
@@ -242,7 +301,6 @@ async def ws_endpoint(websocket: WebSocket, conversation_id: str, token: str = Q
     if not convo or user_id not in convo.get("participant_ids", []):
         await websocket.close(code=4403)
         return
-
     user = await db.users.find_one({"_id": user_id})
     if not user:
         await websocket.close(code=4401)
@@ -252,6 +310,17 @@ async def ws_endpoint(websocket: WebSocket, conversation_id: str, token: str = Q
     try:
         while True:
             data = await websocket.receive_json()
+            event_type = data.get("event", "message")
+
+            if event_type == "typing":
+                await manager.broadcast(conversation_id, {
+                    "type": "typing",
+                    "user_id": str(user_id),
+                    "name": user.get("full_name"),
+                    "is_typing": bool(data.get("is_typing")),
+                })
+                continue
+
             content = (data.get("content") or "").strip()
             attachments = data.get("attachments") or []
             if not content and not attachments:
@@ -265,10 +334,14 @@ async def ws_endpoint(websocket: WebSocket, conversation_id: str, token: str = Q
                 "attachments": attachments,
                 "created_at": now,
             }
-            result = await db.messages.insert_one(doc)
-            doc["_id"] = result.inserted_id
+            res = await db.messages.insert_one(doc)
+            doc["_id"] = res.inserted_id
             await db.conversations.update_one(
                 {"_id": convo["_id"]}, {"$set": {"last_message_at": now}}
+            )
+            await db.chat_reads.update_one(
+                {"conversation_id": convo["_id"], "user_id": user_id},
+                {"$set": {"last_read_at": now}}, upsert=True,
             )
             out = doc_to_dict(doc)
             out["sender"] = serialize_user(user)

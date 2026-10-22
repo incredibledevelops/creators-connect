@@ -1,8 +1,8 @@
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-import hashlib
 
-from jose import JWTError, jwt
+from jose import jwt
 from passlib.context import CryptContext
 
 from app.config import settings
@@ -36,9 +36,32 @@ def create_refresh_token(subject: str, expires_delta: Optional[timedelta] = None
     return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 
 
+def create_short_token(subject: str, purpose: str, minutes: int) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    payload = {"sub": subject, "exp": expire, "type": purpose}
+    return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+
 def decode_token(token: str) -> dict:
     return jwt.decode(token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
 
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+# ---------- Fernet (Drive tokens at rest) ----------
+from cryptography.fernet import Fernet, InvalidToken
+
+_fernet = Fernet(settings.TOKEN_ENCRYPTION_KEY.encode())
+
+
+def encrypt_secret(value: str) -> str:
+    return _fernet.encrypt(value.encode()).decode()
+
+
+def decrypt_secret(value: str) -> str:
+    try:
+        return _fernet.decrypt(value.encode()).decode()
+    except InvalidToken:
+        raise ValueError("Could not decrypt stored secret (bad TOKEN_ENCRYPTION_KEY?)")

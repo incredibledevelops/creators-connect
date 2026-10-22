@@ -1,9 +1,8 @@
-"""Paystack helper (GHS, manual 30-day cycles, no auto-renew)."""
 import hashlib
 import hmac
 import secrets
-import httpx
 
+import httpx
 from fastapi import HTTPException
 
 from app.config import settings

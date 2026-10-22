@@ -44,3 +44,111 @@ creators-connect/
 │           ├── drive.py
 │           └── payments.py
 └── frontend/                       ← (Next.js — next step)
+
+
+
+creators-connect/frontend/
+├── .env.local.example
+├── .gitignore
+├── jsconfig.json
+├── next.config.mjs
+├── package.json
+├── postcss.config.mjs
+├── tailwind.config.js
+├── middleware.js
+├── public/
+│   └── favicon.svg
+├── app/
+│   ├── globals.css
+│   ├── layout.jsx
+│   ├── page.jsx
+│   ├── (auth)/
+│   │   ├── layout.jsx
+│   │   ├── login/page.jsx
+│   │   ├── signup/page.jsx
+│   │   ├── forgot-password/page.jsx
+│   │   ├── reset-password/page.jsx
+│   │   └── verify-email/page.jsx
+│   ├── (app)/
+│   │   ├── layout.jsx
+│   │   ├── dashboard/page.jsx
+│   │   ├── projects/page.jsx
+│   │   ├── projects/[id]/page.jsx
+│   │   ├── chat/page.jsx
+│   │   ├── scheduler/page.jsx
+│   │   ├── drive/page.jsx
+│   │   ├── workspace/page.jsx
+│   │   ├── billing/page.jsx
+│   │   ├── billing/verify/page.jsx
+│   │   └── settings/page.jsx
+│   └── api/
+│       └── auth/
+│           ├── set-refresh/route.js
+│           ├── refresh/route.js
+│           └── clear/route.js
+├── components/
+│   ├── ui/
+│   │   ├── Button.jsx
+│   │   ├── Card.jsx
+│   │   ├── Input.jsx
+│   │   ├── Textarea.jsx
+│   │   ├── Select.jsx
+│   │   ├── Badge.jsx
+│   │   ├── Avatar.jsx
+│   │   ├── Modal.jsx
+│   │   ├── Tabs.jsx
+│   │   ├── Toast.jsx
+│   │   └── Progress.jsx
+│   ├── layout/
+│   │   ├── Sidebar.jsx
+│   │   ├── TopBar.jsx
+│   │   ├── AppShell.jsx
+│   │   └── TrialBanner.jsx
+│   ├── auth/
+│   │   ├── AuthGuard.jsx
+│   │   ├── LoginForm.jsx
+│   │   ├── SignupForm.jsx
+│   │   ├── ForgotPasswordForm.jsx
+│   │   ├── ResetPasswordForm.jsx
+│   │   └── VerifyEmailPanel.jsx
+│   ├── dashboard/
+│   │   ├── StatCard.jsx
+│   │   ├── ActivityFeed.jsx
+│   │   └── UpcomingPosts.jsx
+│   ├── projects/
+│   │   ├── ProjectCard.jsx
+│   │   ├── ProjectGrid.jsx
+│   │   ├── MemberList.jsx
+│   │   ├── FileList.jsx
+│   │   ├── UploadZone.jsx
+│   │   └── NewProjectModal.jsx
+│   ├── chat/
+│   │   ├── ConversationList.jsx
+│   │   ├── MessageList.jsx
+│   │   ├── Composer.jsx
+│   │   └── TypingIndicator.jsx
+│   ├── scheduler/
+│   │   ├── CalendarStrip.jsx
+│   │   ├── QueueList.jsx
+│   │   ├── ScheduleModal.jsx
+│   │   └── PlatformPicker.jsx
+│   ├── drive/
+│   │   ├── DriveStatusCard.jsx
+│   │   ├── FileBrowser.jsx
+│   │   └── UploadButton.jsx
+│   ├── workspace/
+│   │   ├── SeatBar.jsx
+│   │   ├── MemberTable.jsx
+│   │   └── InviteDialog.jsx
+│   └── billing/
+│       ├── PlanCard.jsx
+│       ├── PaymentHistory.jsx
+│       └── SubscribeButton.jsx
+├── lib/
+│   ├── types.js
+│   ├── api.js
+│   ├── auth-context.jsx
+│   ├── toast.jsx
+│   ├── websocket.js
+│   └── utils.js
+└── README.md

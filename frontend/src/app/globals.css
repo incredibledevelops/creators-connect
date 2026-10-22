@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap");
+
+@theme {
+  /* Your custom colors */
+  --color-brand-50: #f3f2ff;
+  --color-brand-100: #e9e7ff;
+  --color-brand-200: #d6d2ff;
+  --color-brand-300: #b8b0ff;
+  --color-brand-400: #9486ff;
+  --color-brand-500: #7a63f6;
+  --color-brand-600: #6845ea;
+  --color-brand-700: #5936cf;
+  --color-brand-800: #4a2ea8;
+  --color-brand-900: #3f2a86;
+
+  --color-mint-50: #eefbf6;
+  --color-mint-100: #d6f5e9;
+  --color-mint-200: #aeead6;
+  --color-mint-300: #78d9bd;
+  --color-mint-400: #42c1a0;
+  --color-mint-500: #1fa888;
+  --color-mint-600: #128a70;
+  --color-mint-700: #106e5b;
+  --color-mint-800: #105849;
+  --color-mint-900: #0e493d;
+
+  --color-ink: #0d1020;
+
+  /* Your custom fonts */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Plus Jakarta Sans", "Inter", sans-serif;
+}
+
+:root {
+  --ring: 122 99 246;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+*:focus-visible {
+  outline: 2px solid rgb(var(--ring) / 0.6);
+  outline-offset: 2px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d8dbe6;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.fade-in {
+  animation: fade-in 0.35s ease both;
+}
+
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.pop {
+  animation: pop 0.25s cubic-bezier(0.2, 0.9, 0.3, 1.4) both;
+}

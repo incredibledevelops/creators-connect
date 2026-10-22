@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
@@ -21,15 +23,16 @@ async def update_me(payload: UserUpdate, user: dict = Depends(get_current_user))
     update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
 
     if "handle" in update:
-        clash = await db.users.find_one({"handle": update["handle"].lower(), "_id": {"$ne": user["_id"]}})
+        update["handle"] = update["handle"].lower()
+        clash = await db.users.find_one({
+            "handle": update["handle"], "_id": {"$ne": user["_id"]}
+        })
         if clash:
             raise HTTPException(status_code=400, detail="That handle is already taken.")
-        update["handle"] = update["handle"].lower()
 
     if not update:
         return {"user": serialize_user(user)}
 
-    from datetime import datetime, timezone
     update["updated_at"] = datetime.now(timezone.utc)
     await db.users.update_one({"_id": user["_id"]}, {"$set": update})
     fresh = await db.users.find_one({"_id": user["_id"]})
@@ -40,7 +43,6 @@ async def update_me(payload: UserUpdate, user: dict = Depends(get_current_user))
 async def upload_avatar(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     db = get_db()
     url = await save_avatar(str(user["_id"]), file)
-    from datetime import datetime, timezone
     await db.users.update_one(
         {"_id": user["_id"]},
         {"$set": {"avatar_url": url, "updated_at": datetime.now(timezone.utc)}},
@@ -54,17 +56,14 @@ async def get_public_profile(user_id: str, _: dict = Depends(get_current_user)):
         oid = ObjectId(user_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user id.")
-
     db = get_db()
     user = await db.users.find_one({"_id": oid})
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    safe = serialize_user(user)
-    # Public fields only
     return {"user": {
-        "id": safe["id"],
-        "full_name": safe.get("full_name"),
-        "handle": safe.get("handle"),
-        "bio": safe.get("bio"),
-        "avatar_url": safe.get("avatar_url"),
+        "id": str(user["_id"]),
+        "full_name": user.get("full_name"),
+        "handle": user.get("handle"),
+        "bio": user.get("bio"),
+        "avatar_url": user.get("avatar_url"),
     }}

@@ -1,14 +1,17 @@
 from datetime import datetime, timezone
-from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 
+from app.config import settings
 from app.database import get_db
 from app.dependencies import get_current_user, require_active_subscription
 from app.schemas.project import (
     ProjectCreate, ProjectFileAdd, ProjectMemberAdd, ProjectUpdate,
 )
+from app.services import google_drive as drive_service
+from app.utils import activity as activity_service
+from app.utils.pagination import build_page, parse_cursor
 from app.utils.serializers import doc_to_dict, serialize_user
 
 router = APIRouter()
@@ -26,7 +29,6 @@ async def _get_project_for_user(project_id: str, user_id: ObjectId) -> dict:
     project = await db.projects.find_one({"_id": _oid(project_id, "project id")})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found.")
-
     allowed = project["owner_id"] == user_id or any(
         m["user_id"] == user_id for m in project.get("members", [])
     )
@@ -36,16 +38,25 @@ async def _get_project_for_user(project_id: str, user_id: ObjectId) -> dict:
 
 
 @router.get("")
-async def list_projects(user: dict = Depends(get_current_user)):
+async def list_projects(
+    limit: int = Query(default=24, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    user: dict = Depends(get_current_user),
+):
     db = get_db()
-    cursor = db.projects.find({
-        "$or": [
-            {"owner_id": user["_id"]},
-            {"members.user_id": user["_id"]},
-        ]
-    }).sort("updated_at", -1)
-    docs = await cursor.to_list(length=200)
-    return {"projects": [doc_to_dict(d) for d in docs]}
+    query: dict = {
+        "$or": [{"owner_id": user["_id"]}, {"members.user_id": user["_id"]}]
+    }
+    cur_oid = parse_cursor(cursor)
+    if cur_oid:
+        query["_id"] = {"$lt": cur_oid}
+    docs = await db.projects.find(query).sort("_id", -1).limit(limit + 1).to_list(limit + 1)
+    page = build_page(docs, limit)
+    return {
+        "projects": [doc_to_dict(d) for d in page["items"]],
+        "next_cursor": page["next_cursor"],
+        "has_more": page["has_more"],
+    }
 
 
 @router.post("", status_code=201)
@@ -55,6 +66,16 @@ async def create_project(
 ):
     db = get_db()
     now = datetime.now(timezone.utc)
+
+    # Ensure a project Drive subfolder
+    drive_folder_id = None
+    if await drive_service.get_connection(user["_id"]):
+        try:
+            folder = await drive_service.create_folder(user["_id"], payload.name.strip())
+            drive_folder_id = folder["id"]
+        except Exception as e:
+            print(f"[drive] folder create failed: {e}")
+
     doc = {
         "name": payload.name.strip(),
         "description": (payload.description or "").strip(),
@@ -64,14 +85,14 @@ async def create_project(
         "members": [],
         "files": [],
         "status": "draft",
+        "drive_folder_id": drive_folder_id,
         "created_at": now,
         "updated_at": now,
     }
     result = await db.projects.insert_one(doc)
     doc["_id"] = result.inserted_id
 
-    # Auto-create project chat room
-    convo = {
+    await db.conversations.insert_one({
         "type": "project",
         "name": doc["name"],
         "project_id": result.inserted_id,
@@ -79,9 +100,14 @@ async def create_project(
         "created_by": user["_id"],
         "last_message_at": now,
         "created_at": now,
-    }
-    await db.conversations.insert_one(convo)
+    })
 
+    await activity_service.emit(
+        user["_id"], kind="project_created",
+        title=f"Project created: {doc['name']}",
+        project_id=result.inserted_id,
+        link=f"/projects/{result.inserted_id}",
+    )
     return {"project": doc_to_dict(doc)}
 
 
@@ -90,10 +116,8 @@ async def get_project(project_id: str, user: dict = Depends(get_current_user)):
     project = await _get_project_for_user(project_id, user["_id"])
     db = get_db()
 
-    # Enrich with member profiles
     member_ids = [m["user_id"] for m in project.get("members", [])] + [project["owner_id"]]
-    members_cursor = db.users.find({"_id": {"$in": member_ids}})
-    member_docs = await members_cursor.to_list(length=50)
+    member_docs = await db.users.find({"_id": {"$in": member_ids}}).to_list(50)
     member_map = {str(u["_id"]): serialize_user(u) for u in member_docs}
 
     data = doc_to_dict(project)
@@ -110,12 +134,11 @@ async def update_project(project_id: str, payload: ProjectUpdate, user: dict = D
     project = await _get_project_for_user(project_id, user["_id"])
     if project["owner_id"] != user["_id"]:
         raise HTTPException(status_code=403, detail="Only the owner can edit this project.")
-
-    db = get_db()
     update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if not update:
         return {"project": doc_to_dict(project)}
     update["updated_at"] = datetime.now(timezone.utc)
+    db = get_db()
     await db.projects.update_one({"_id": project["_id"]}, {"$set": update})
     fresh = await db.projects.find_one({"_id": project["_id"]})
     return {"project": doc_to_dict(fresh)}
@@ -147,19 +170,40 @@ async def add_member(project_id: str, payload: ProjectMemberAdd, user: dict = De
     if member_oid == project["owner_id"] or any(m["user_id"] == member_oid for m in project.get("members", [])):
         return {"project": doc_to_dict(project)}
 
+    # Workspace seat enforcement
+    ws = await db.workspaces.find_one({"owner_id": user["_id"]})
+    if ws and member_oid not in ws["member_ids"]:
+        from app.utils.plans import get_seat_limit
+        plan = user.get("subscription", {}).get("plan", "trial")
+        seat_limit = get_seat_limit("pro") if plan == "trial" else get_seat_limit(plan)
+        if len(ws["member_ids"]) >= seat_limit:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Your plan allows {seat_limit} seat(s). Upgrade to add more people.",
+            )
+        await db.workspaces.update_one(
+            {"_id": ws["_id"]},
+            {"$addToSet": {"member_ids": member_oid},
+             "$set": {"updated_at": datetime.now(timezone.utc)}},
+        )
+
     await db.projects.update_one(
         {"_id": project["_id"]},
         {"$push": {"members": {
-            "user_id": member_oid,
-            "role": payload.role,
+            "user_id": member_oid, "role": payload.role,
             "joined_at": datetime.now(timezone.utc),
         }},
          "$set": {"updated_at": datetime.now(timezone.utc)}},
     )
-    # Add to project chat
     await db.conversations.update_many(
         {"project_id": project["_id"]},
         {"$addToSet": {"participant_ids": member_oid}},
+    )
+    await activity_service.emit(
+        member_oid, kind="project_added",
+        title=f"Added to project: {project['name']}",
+        project_id=project["_id"],
+        link=f"/projects/{project['_id']}",
     )
     fresh = await db.projects.find_one({"_id": project["_id"]})
     return {"project": doc_to_dict(fresh)}
@@ -170,9 +214,8 @@ async def remove_member(project_id: str, member_user_id: str, user: dict = Depen
     project = await _get_project_for_user(project_id, user["_id"])
     if project["owner_id"] != user["_id"]:
         raise HTTPException(status_code=403, detail="Only the owner can remove members.")
-
-    db = get_db()
     member_oid = _oid(member_user_id, "user id")
+    db = get_db()
     await db.projects.update_one(
         {"_id": project["_id"]},
         {"$pull": {"members": {"user_id": member_oid}},
@@ -185,11 +228,79 @@ async def remove_member(project_id: str, member_user_id: str, user: dict = Depen
     return None
 
 
-@router.post("/{project_id}/files", status_code=201)
-async def add_project_file(project_id: str, payload: ProjectFileAdd, user: dict = Depends(get_current_user)):
+@router.post("/{project_id}/upload", status_code=201)
+async def upload_to_project(
+    project_id: str,
+    file: UploadFile = File(...),
+    user: dict = Depends(require_active_subscription),
+):
     project = await _get_project_for_user(project_id, user["_id"])
-    db = get_db()
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided.")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(content) > settings.MAX_DRIVE_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File exceeds {settings.MAX_DRIVE_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+        )
 
+    parent = project.get("drive_folder_id")
+    if not parent:
+        # Recover by creating a folder now
+        folder = await drive_service.create_folder(user["_id"], project["name"])
+        parent = folder["id"]
+        await get_db().projects.update_one(
+            {"_id": project["_id"]}, {"$set": {"drive_folder_id": parent}}
+        )
+
+    uploaded = await drive_service.upload_file(
+        user_id=user["_id"],
+        file_bytes=content,
+        filename=file.filename,
+        mime_type=file.content_type or "application/octet-stream",
+        parent_folder_id=parent,
+    )
+
+    file_doc = {
+        "drive_file_id": uploaded["id"],
+        "name": uploaded.get("name", file.filename),
+        "mime_type": uploaded.get("mimeType", file.content_type),
+        "size": int(uploaded.get("size", len(content))),
+        "web_view_link": uploaded.get("webViewLink"),
+        "uploaded_by": user["_id"],
+        "uploaded_at": datetime.now(timezone.utc),
+    }
+    await get_db().projects.update_one(
+        {"_id": project["_id"]},
+        {"$push": {"files": file_doc},
+         "$set": {"updated_at": datetime.now(timezone.utc)}},
+    )
+    await activity_service.emit(
+        user["_id"], kind="project_file_uploaded",
+        title=f"Uploaded to {project['name']}: {file_doc['name']}",
+        project_id=project["_id"],
+        link=f"/projects/{project['_id']}",
+    )
+    return {"file": {**file_doc, "uploaded_by": str(user["_id"]),
+                     "uploaded_at": file_doc["uploaded_at"].isoformat()}}
+
+
+@router.delete("/{project_id}/files/{drive_file_id}", status_code=204)
+async def remove_project_file(project_id: str, drive_file_id: str, user: dict = Depends(get_current_user)):
+    project = await _get_project_for_user(project_id, user["_id"])
+    await get_db().projects.update_one(
+        {"_id": project["_id"]},
+        {"$pull": {"files": {"drive_file_id": drive_file_id}},
+         "$set": {"updated_at": datetime.now(timezone.utc)}},
+    )
+    return None
+
+
+@router.post("/{project_id}/files", status_code=201)
+async def attach_existing_file(project_id: str, payload: ProjectFileAdd, user: dict = Depends(get_current_user)):
+    project = await _get_project_for_user(project_id, user["_id"])
     file_doc = {
         "drive_file_id": payload.drive_file_id,
         "name": payload.name,
@@ -199,21 +310,10 @@ async def add_project_file(project_id: str, payload: ProjectFileAdd, user: dict 
         "uploaded_by": user["_id"],
         "uploaded_at": datetime.now(timezone.utc),
     }
-    await db.projects.update_one(
+    await get_db().projects.update_one(
         {"_id": project["_id"]},
         {"$push": {"files": file_doc},
          "$set": {"updated_at": datetime.now(timezone.utc)}},
     )
-    return {"file": {**file_doc, "uploaded_by": str(user["_id"]), "uploaded_at": file_doc["uploaded_at"].isoformat()}}
-
-
-@router.delete("/{project_id}/files/{drive_file_id}", status_code=204)
-async def remove_project_file(project_id: str, drive_file_id: str, user: dict = Depends(get_current_user)):
-    project = await _get_project_for_user(project_id, user["_id"])
-    db = get_db()
-    await db.projects.update_one(
-        {"_id": project["_id"]},
-        {"$pull": {"files": {"drive_file_id": drive_file_id}},
-         "$set": {"updated_at": datetime.now(timezone.utc)}},
-    )
-    return None
+    return {"file": {**file_doc, "uploaded_by": str(user["_id"]),
+                     "uploaded_at": file_doc["uploaded_at"].isoformat()}}

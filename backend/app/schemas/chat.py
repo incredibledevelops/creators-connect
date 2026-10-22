@@ -1,12 +1,12 @@
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
 
 
 class ConversationCreate(BaseModel):
     type: Literal["dm", "project"]
-    participant_id: Optional[str] = None   # for DMs
-    project_id: Optional[str] = None        # for project rooms
-    name: Optional[str] = None              # optional override for project room
+    participant_id: Optional[str] = None
+    project_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class AttachmentIn(BaseModel):

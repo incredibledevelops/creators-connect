@@ -33,5 +33,10 @@ def doc_to_dict(doc: dict | None, remove: list[str] | None = None) -> dict | Non
     return _jsonable(data)
 
 
-def serialize_user(user: dict | None) -> dict | None:
-    return doc_to_dict(user, remove=["password_hash"])
+def serialize_user(user: dict | None, include_sensitive: bool = False) -> dict | None:
+    if not user:
+        return None
+    remove = ["password_hash"]
+    if not include_sensitive:
+        remove += ["email_verified", "email_verification_sent_at"]
+    return doc_to_dict(user, remove=remove)

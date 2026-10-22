@@ -1,10 +1,6 @@
-"""Per-user Google Drive integration.
-
-Each user connects their own Drive via OAuth2. We store their refresh token
-encrypted-at-rest in MongoDB (should be encrypted for production — see note).
-User media (images/videos scheduled to socials) lives ONLY in their Drive.
-"""
+"""Per-user Google Drive integration with encrypted refresh tokens."""
 import asyncio
+import io
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,10 +9,11 @@ from fastapi import HTTPException
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload
 from google_auth_oauthlib.flow import Flow
 
 from app.config import settings
+from app.core.security import decrypt_secret, encrypt_secret
 from app.database import get_db
 
 APP_FOLDER_NAME = "Creators Connect"
@@ -61,17 +58,17 @@ def _build_service(creds: Credentials):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-def _ensure_folder(service) -> str:
-    """Return the app folder id in the user's drive, creating it if needed."""
-    query = (
-        f"name = '{APP_FOLDER_NAME}' and "
-        "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    )
-    res = service.files().list(q=query, spaces="drive", fields="files(id, name)").execute()
+def _ensure_folder(service, name: str = APP_FOLDER_NAME, parent: str | None = None) -> str:
+    q = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent:
+        q += f" and '{parent}' in parents"
+    res = service.files().list(q=q, spaces="drive", fields="files(id, name)").execute()
     files = res.get("files", [])
     if files:
         return files[0]["id"]
-    meta = {"name": APP_FOLDER_NAME, "mimeType": "application/vnd.google-apps.folder"}
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent:
+        meta["parents"] = [parent]
     folder = service.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
@@ -81,23 +78,22 @@ async def store_connection(user_id: ObjectId, creds: Credentials) -> dict:
     service = _build_service(creds)
     folder_id = await asyncio.to_thread(_ensure_folder, service)
 
-    # Try to fetch user's email from the token
     google_email = None
     try:
-        token_info = await asyncio.to_thread(
+        info = await asyncio.to_thread(
             lambda: build("oauth2", "v2", credentials=creds, cache_discovery=False)
             .userinfo().get().execute()
         )
-        google_email = token_info.get("email")
+        google_email = info.get("email")
     except Exception:
         pass
 
     now = datetime.now(timezone.utc)
-    doc = {
+    update = {
         "user_id": user_id,
         "google_email": google_email,
-        "access_token": creds.token,
-        "refresh_token": creds.refresh_token,
+        "access_token_enc": encrypt_secret(creds.token or ""),
+        "refresh_token_enc": encrypt_secret(creds.refresh_token or ""),
         "token_expiry": creds.expiry,
         "scopes": list(creds.scopes or settings.GOOGLE_SCOPES),
         "folder_id": folder_id,
@@ -105,9 +101,9 @@ async def store_connection(user_id: ObjectId, creds: Credentials) -> dict:
         "updated_at": now,
     }
     await db.drive_connections.update_one(
-        {"user_id": user_id}, {"$set": doc, "$setOnInsert": {"created_at": now}}, upsert=True
+        {"user_id": user_id}, {"$set": update}, upsert=True
     )
-    return doc
+    return update
 
 
 async def get_connection(user_id: ObjectId) -> Optional[dict]:
@@ -116,14 +112,19 @@ async def get_connection(user_id: ObjectId) -> Optional[dict]:
 
 
 async def get_service(user_id: ObjectId) -> tuple:
-    """Return (service, folder_id). Refreshes token if needed."""
     conn = await get_connection(user_id)
     if not conn:
         raise HTTPException(status_code=400, detail="Google Drive not connected.")
 
+    try:
+        access_token = decrypt_secret(conn["access_token_enc"])
+        refresh_token = decrypt_secret(conn["refresh_token_enc"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="Stored Drive credentials corrupted.")
+
     creds = Credentials(
-        token=conn.get("access_token"),
-        refresh_token=conn.get("refresh_token"),
+        token=access_token,
+        refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=settings.GOOGLE_CLIENT_ID,
         client_secret=settings.GOOGLE_CLIENT_SECRET,
@@ -142,7 +143,7 @@ async def get_service(user_id: ObjectId) -> tuple:
         await db.drive_connections.update_one(
             {"user_id": user_id},
             {"$set": {
-                "access_token": creds.token,
+                "access_token_enc": encrypt_secret(creds.token or ""),
                 "token_expiry": creds.expiry,
                 "updated_at": datetime.now(timezone.utc),
             }},
@@ -159,33 +160,49 @@ async def get_service(user_id: ObjectId) -> tuple:
     return service, folder_id
 
 
+async def create_folder(user_id: ObjectId, name: str, parent: Optional[str] = None) -> dict:
+    service, root_id = await get_service(user_id)
+    parent = parent or root_id
+    folder = await asyncio.to_thread(
+        lambda: service.files()
+        .create(
+            body={"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]},
+            fields="id, name, webViewLink, createdTime",
+        )
+        .execute()
+    )
+    return folder
+
+
 async def upload_file(
     user_id: ObjectId,
     file_bytes: bytes,
     filename: str,
     mime_type: str,
+    parent_folder_id: Optional[str] = None,
 ) -> dict:
-    service, folder_id = await get_service(user_id)
-    import io
-
+    service, root_id = await get_service(user_id)
+    parent = parent_folder_id or root_id
     media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=True)
-    metadata = {"name": filename, "parents": [folder_id]}
-
     file = await asyncio.to_thread(
         lambda: service.files()
-        .create(body=metadata, media_body=media,
-                fields="id, name, mimeType, size, webViewLink, webContentLink, createdTime")
+        .create(
+            body={"name": filename, "parents": [parent]},
+            media_body=media,
+            fields="id, name, mimeType, size, webViewLink, webContentLink, createdTime",
+        )
         .execute()
     )
     return file
 
 
-async def list_files(user_id: ObjectId) -> list[dict]:
-    service, folder_id = await get_service(user_id)
+async def list_files(user_id: ObjectId, parent: Optional[str] = None) -> list[dict]:
+    service, root_id = await get_service(user_id)
+    parent = parent or root_id
     res = await asyncio.to_thread(
         lambda: service.files()
         .list(
-            q=f"'{folder_id}' in parents and trashed = false",
+            q=f"'{parent}' in parents and trashed = false",
             spaces="drive",
             orderBy="modifiedTime desc",
             fields="files(id, name, mimeType, size, webViewLink, webContentLink, modifiedTime, createdTime)",

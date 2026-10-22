@@ -52,3 +52,8 @@ PLANS: dict[str, dict] = {
 
 def get_plan(plan_id: str) -> dict | None:
     return PLANS.get(plan_id)
+
+
+def get_seat_limit(plan_id: str) -> int:
+    plan = PLANS.get(plan_id)
+    return plan["seats"] if plan else 1

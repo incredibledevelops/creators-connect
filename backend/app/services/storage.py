@@ -1,9 +1,9 @@
-"""Local storage for system files: avatars, chat uploads.
-User media that gets scheduled to socials is stored in the user's Google Drive."""
-from pathlib import Path
+"""Local system-file storage (avatars, chat uploads).
+User media scheduled to socials lives in the user's Google Drive."""
 import uuid
+from pathlib import Path
 
-from fastapi import UploadFile, HTTPException
+from fastapi import HTTPException, UploadFile
 
 from app.config import settings
 
@@ -28,16 +28,16 @@ ALLOWED_CHAT_TYPES = ALLOWED_IMAGE_TYPES | {
     "audio/webm",
 }
 
-MAX_AVATAR_SIZE = 2 * 1024 * 1024          # 2 MB
-MAX_CHAT_FILE_SIZE = 50 * 1024 * 1024      # 50 MB
-
 
 async def save_avatar(user_id: str, file: UploadFile) -> str:
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(status_code=400, detail="Avatar must be JPEG, PNG, WEBP or GIF.")
     content = await file.read()
-    if len(content) > MAX_AVATAR_SIZE:
-        raise HTTPException(status_code=400, detail="Avatar must be ≤ 2 MB.")
+    if len(content) > settings.MAX_AVATAR_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Avatar must be ≤ {settings.MAX_AVATAR_BYTES // (1024 * 1024)} MB.",
+        )
     ext = Path(file.filename or "").suffix.lower() or ".jpg"
     fname = f"{user_id}_{uuid.uuid4().hex}{ext}"
     (AVATAR_DIR / fname).write_bytes(content)
@@ -48,8 +48,11 @@ async def save_chat_file(conversation_id: str, file: UploadFile) -> dict:
     if file.content_type not in ALLOWED_CHAT_TYPES:
         raise HTTPException(status_code=400, detail="File type not allowed.")
     content = await file.read()
-    if len(content) > MAX_CHAT_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File must be ≤ 50 MB.")
+    if len(content) > settings.MAX_CHAT_FILE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File must be ≤ {settings.MAX_CHAT_FILE_BYTES // (1024 * 1024)} MB.",
+        )
     ext = Path(file.filename or "").suffix.lower()
     stored = f"{conversation_id}_{uuid.uuid4().hex}{ext}"
     (CHAT_DIR / stored).write_bytes(content)
